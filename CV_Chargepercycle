@@ -1,0 +1,266 @@
+
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# USER SETTING
+# ============================================================
+
+summary_file = Path(r"E:\CV_9_9_26\CV_summary.csv")
+
+
+# ============================================================
+# LOAD SUMMARY
+# ============================================================
+
+df = pd.read_csv(summary_file)
+
+output_folder = summary_file.parent
+
+
+# ============================================================
+# AREA CONVERSION
+# ============================================================
+
+# Area_um2 already exists in CV_summary.csv
+df["Area_cm2"] = df["Area_um2"] / 1e8
+
+
+# ============================================================
+# CONVERT CSC TO ABSOLUTE CHARGE
+# ============================================================
+
+# CSC [mC/cm^2] * area [cm^2] = charge [mC]
+# multiply by 1000 to convert mC -> uC
+
+df["Cathodic_Q_uC"] = (
+    df["Cathodic_CSC_Mean_mC_cm2"]
+    * df["Area_cm2"]
+    * 1000
+)
+
+df["Anodic_Q_uC"] = (
+    df["Anodic_CSC_Mean_mC_cm2"]
+    * df["Area_cm2"]
+    * 1000
+)
+
+# ============================================================
+# SAVE UPDATED SUMMARY
+# ============================================================
+
+output_csv = output_folder / "CV_summary_with_absolute_charge.csv"
+
+df.to_csv(output_csv, index=False)
+
+print(f"Saved:")
+print(output_csv)
+
+
+# ============================================================
+# FUNCTION FOR Q VS AREA PLOT
+# ============================================================
+
+def plot_charge_vs_area(
+    dataframe,
+    charge_column,
+    charge_name,
+    filename
+):
+
+    plt.figure(figsize=(7, 5))
+
+    # --------------------------------------------------------
+    # Plot each material separately
+    # --------------------------------------------------------
+
+    materials = dataframe["Material"].dropna().unique()
+
+    for material in materials:
+
+        subset = dataframe[
+            dataframe["Material"] == material
+        ].copy()
+
+        subset = subset.sort_values("Area_um2")
+
+        x = subset["Area_um2"].to_numpy()
+        y = subset[charge_column].to_numpy()
+
+        plt.scatter(
+            x,
+            y,
+            label=f"{material} data"
+        )
+
+        # ----------------------------------------------------
+        # Linear fit:
+        #
+        # Q = k*A + Q0
+        #
+        # Only fit if at least 2 valid points exist
+        # ----------------------------------------------------
+
+       # Valid numeric points
+        valid = np.isfinite(x) & np.isfinite(y)
+
+        # Exclude 100 x 100 um electrodes from the regression only
+        fit_mask = valid & (subset["Size_um"].to_numpy() != 100)
+
+        x_fit_data = x[fit_mask]
+        y_fit_data = y[fit_mask]
+        if len(x_fit_data) >= 2:
+
+            slope, intercept = np.polyfit(
+                x_fit_data,
+                y_fit_data,
+                1
+            )
+
+            x_line = np.linspace(
+                0,
+                x_fit_data.max() * 1.05,
+                300
+            )
+
+            y_line = slope * x_line + intercept
+
+            plt.plot(
+                x_line,
+                y_line,
+                label=(
+                    f"{material} fit: "
+                    f"Q = {slope:.3e}A "
+                    f"+ {intercept:.3f} uC"
+                )
+            )
+
+            print()
+            print(f"{charge_name} - {material}")
+            print(f"Slope Q/A: {slope:.6e} uC/um^2")
+            print(f"Intercept Q0: {intercept:.6f} uC")
+
+
+    # --------------------------------------------------------
+    # Formatting
+    # --------------------------------------------------------
+
+    plt.xlabel("Geometric Electrode Area (um²)")
+    plt.ylabel(f"{charge_name} Charge per Cycle (uC)")
+
+    plt.title(
+        f"{charge_name} Absolute Charge vs Electrode Area"
+    )
+
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    save_path = output_folder / filename
+
+    plt.savefig(
+        save_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    print(f"Saved: {save_path}")
+
+
+# ============================================================
+# MAKE ABSOLUTE CHARGE PLOTS
+# ============================================================
+
+plot_charge_vs_area(
+    dataframe=df,
+    charge_column="Cathodic_Q_uC",
+    charge_name="Cathodic",
+    filename="Cathodic_Q_vs_Area.jpg"
+)
+
+plot_charge_vs_area(
+    dataframe=df,
+    charge_column="Anodic_Q_uC",
+    charge_name="Anodic",
+    filename="Anodic_Q_vs_Area.jpg"
+)
+
+
+# ============================================================
+# ALSO PLOT CSC VS AREA FOR DIRECT COMPARISON
+# ============================================================
+df_csc = df[df["Size_um"] != 100].copy()
+
+def plot_csc_vs_area(
+    dataframe,
+    csc_column,
+    csc_name,
+    filename
+):
+
+    plt.figure(figsize=(7, 5))
+
+    materials = dataframe["Material"].dropna().unique()
+
+    for material in materials:
+
+        subset = dataframe[
+            dataframe["Material"] == material
+        ].copy()
+
+        subset = subset.sort_values("Area_um2")
+
+        plt.plot(
+            subset["Area_um2"],
+            subset[csc_column],
+            marker="o",
+            label=material
+        )
+
+    plt.xlabel("Geometric Electrode Area (um²)")
+    plt.ylabel(f"{csc_name} CSC (mC/cm²)")
+
+    plt.title(
+        f"{csc_name} CSC vs Electrode Area"
+    )
+
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    save_path = output_folder / filename
+
+    plt.savefig(
+        save_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    print(f"Saved: {save_path}")
+
+
+plot_csc_vs_area(
+    dataframe=df_csc,
+    csc_column="Cathodic_CSC_Mean_mC_cm2",
+    csc_name="Cathodic",
+    filename="Cathodic_CSC_vs_Area.jpg"
+)
+
+plot_csc_vs_area(
+    dataframe=df_csc,
+    csc_column="Anodic_CSC_Mean_mC_cm2",
+    csc_name="Anodic",
+    filename="Anodic_CSC_vs_Area.jpg"
+)
+
+
+print()
+print("Done.")
+

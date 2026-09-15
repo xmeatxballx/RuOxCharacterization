@@ -1,0 +1,1061 @@
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+file_path = Path(r"C:\Users\mtpv1\Downloads\PulseTransients_9_10_26\4_1_Al\4_1_Al_250.csv")
+
+# Approximate window around each pulse
+pre_pulse_ms = 20
+post_pulse_ms = 100
+
+# Baseline window relative to approximate pulse location
+baseline_start_ms = -15
+baseline_end_ms = -2
+
+# Initial rough pulse detection
+rough_detection_threshold_v = 0.8
+
+# Minimum spacing between separate pulses
+minimum_pulse_spacing_ms = 100
+
+# Refined onset detection
+onset_sigma_threshold = 6
+onset_required_samples = 3
+
+# Optional low-pass filter
+apply_lowpass = False
+lowpass_cutoff_hz = 1000
+lowpass_order = 4
+
+# ============================================================
+# VOLTAGE TRANSIENT METRIC SETTINGS
+# ============================================================
+
+# IMPORTANT:
+# Set this to the actual duration of ONE constant-current phase.
+pulse_duration_ms = 0.200
+
+# Stimulator compliance
+compliance_voltage_v = 12.0
+
+# Va is estimated shortly after pulse onset.
+# Avoid using the exact first sample because the edge may contain
+# switching artifact/noise.
+va_start_ms = 0.1
+va_end_ms = 0.5
+
+# Average this much time immediately before the end of the pulse
+# to estimate the polarized voltage near the end of the phase.
+end_pulse_average_ms = 1.0
+
+# Zoomed pulse plots
+save_zoomed_individual_pulses = True
+
+zoom_pre_ms = 2.0
+
+# Amount shown AFTER the end of the pulse
+zoom_post_ms = 2.0
+
+# ============================================================
+# LOAD TEKTRONIX CSV
+# ============================================================
+
+df = pd.read_csv(
+    file_path,
+    header=None,
+    usecols=[3, 4],
+    names=["time_s", "voltage_v"]
+)
+
+df["time_s"] = pd.to_numeric(
+    df["time_s"],
+    errors="coerce"
+)
+
+df["voltage_v"] = pd.to_numeric(
+    df["voltage_v"],
+    errors="coerce"
+)
+
+df = df.dropna().reset_index(drop=True)
+
+time = df["time_s"].to_numpy()
+voltage = df["voltage_v"].to_numpy()
+
+# ============================================================
+# SAMPLING INFORMATION
+# ============================================================
+
+dt = np.median(np.diff(time))
+sampling_rate = 1 / dt
+
+print(f"Sample interval: {dt:.6g} s")
+print(f"Sampling rate: {sampling_rate:.2f} Hz")
+print(f"Recording duration: {time[-1] - time[0]:.2f} s")
+
+# ============================================================
+# OPTIONAL LOW-PASS FILTER
+# ============================================================
+
+if apply_lowpass:
+
+    from scipy.signal import butter, sosfiltfilt
+
+    nyquist = sampling_rate / 2
+
+    if lowpass_cutoff_hz >= nyquist:
+
+        raise ValueError(
+            f"Low-pass cutoff must be below Nyquist "
+            f"({nyquist:.1f} Hz)."
+        )
+
+    sos = butter(
+        lowpass_order,
+        lowpass_cutoff_hz / nyquist,
+        btype="lowpass",
+        output="sos"
+    )
+
+    voltage_for_analysis = sosfiltfilt(
+        sos,
+        voltage
+    )
+
+else:
+
+    voltage_for_analysis = voltage.copy()
+
+# ============================================================
+# ROUGH PULSE DETECTION
+# ============================================================
+#
+# This only finds approximately where each pulse is.
+# Exact onset is refined later using the local baseline.
+# ============================================================
+
+dv = np.diff(voltage_for_analysis)
+
+candidate_indices = np.where(
+    np.abs(dv) >= rough_detection_threshold_v
+)[0] + 1
+
+minimum_spacing_samples = int(
+    minimum_pulse_spacing_ms / 1000 / dt
+)
+
+rough_pulse_indices = []
+
+for index in candidate_indices:
+
+    if len(rough_pulse_indices) == 0:
+
+        rough_pulse_indices.append(index)
+
+    elif (
+        index - rough_pulse_indices[-1]
+        >= minimum_spacing_samples
+    ):
+
+        rough_pulse_indices.append(index)
+
+rough_pulse_indices = np.array(
+    rough_pulse_indices
+)
+
+print(
+    f"\nRoughly detected pulses: "
+    f"{len(rough_pulse_indices)}"
+)
+
+# ============================================================
+# WINDOW LENGTHS
+# ============================================================
+
+pre_samples = int(
+    pre_pulse_ms / 1000 / dt
+)
+
+post_samples = int(
+    post_pulse_ms / 1000 / dt
+)
+
+baseline_start_offset = int(
+    baseline_start_ms / 1000 / dt
+)
+
+baseline_end_offset = int(
+    baseline_end_ms / 1000 / dt
+)
+
+# ============================================================
+# REFINE PULSE ONSET
+# ============================================================
+#
+# For each rough pulse location:
+#
+# 1. Look at the local pre-pulse baseline
+# 2. Calculate baseline mean and noise
+# 3. Find first sustained departure exceeding:
+#
+#       onset_sigma_threshold × baseline SD
+#
+# 4. Require several consecutive samples above threshold
+#
+# ============================================================
+
+refined_pulse_indices = []
+
+for rough_index in rough_pulse_indices:
+
+    # ----------------------------------------
+    # Local baseline region
+    # ----------------------------------------
+
+    baseline_start_index = (
+        rough_index
+        + baseline_start_offset
+    )
+
+    baseline_end_index = (
+        rough_index
+        + baseline_end_offset
+    )
+
+    if baseline_start_index < 0:
+        continue
+
+    if baseline_end_index <= baseline_start_index:
+        continue
+
+    baseline_region = voltage_for_analysis[
+        baseline_start_index:
+        baseline_end_index
+    ]
+
+    if len(baseline_region) < 2:
+        continue
+
+    baseline_mean = np.mean(
+        baseline_region
+    )
+
+    baseline_std = np.std(
+        baseline_region,
+        ddof=1
+    )
+
+    # Prevent an unrealistically tiny threshold
+    if baseline_std == 0:
+        continue
+
+    threshold = (
+        onset_sigma_threshold
+        * baseline_std
+    )
+
+    # ----------------------------------------
+    # Search around rough pulse location
+    # ----------------------------------------
+
+    search_start = max(
+        baseline_end_index,
+        rough_index - int(5 / 1000 / dt)
+    )
+
+    search_end = min(
+        len(voltage_for_analysis)
+        - onset_required_samples,
+        rough_index + int(10 / 1000 / dt)
+    )
+
+    onset_index = None
+
+    for i in range(
+        search_start,
+        search_end
+    ):
+
+        segment = voltage_for_analysis[
+            i:
+            i + onset_required_samples
+        ]
+
+        deviation = np.abs(
+            segment - baseline_mean
+        )
+
+        if np.all(
+            deviation > threshold
+        ):
+
+            onset_index = i
+            break
+
+    # Fall back to rough detection if refinement fails
+    if onset_index is None:
+
+        onset_index = rough_index
+
+    refined_pulse_indices.append(
+        onset_index
+    )
+
+refined_pulse_indices = np.array(
+    refined_pulse_indices
+)
+
+print(
+    f"Refined pulse onsets: "
+    f"{len(refined_pulse_indices)}"
+)
+
+# ============================================================
+# EXTRACT AND BASELINE-CORRECT EACH PULSE
+# ============================================================
+
+relative_time = (
+    np.arange(
+        -pre_samples,
+        post_samples + 1
+    )
+    * dt
+)
+
+pulse_traces = []
+pulse_metrics = []
+
+for pulse_number, pulse_index in enumerate(
+    refined_pulse_indices,
+    start=1
+):
+
+    start_index = (
+        pulse_index - pre_samples
+    )
+
+    end_index = (
+        pulse_index
+        + post_samples
+        + 1
+    )
+
+    if start_index < 0:
+        continue
+
+    if end_index > len(
+        voltage_for_analysis
+    ):
+        continue
+
+    trace = voltage_for_analysis[
+        start_index:
+        end_index
+    ].copy()
+
+    # ========================================================
+    # BASELINE CORRECTION
+    # ========================================================
+
+    baseline_start_in_trace = (
+        pre_samples
+        + baseline_start_offset
+    )
+
+    baseline_end_in_trace = (
+        pre_samples
+        + baseline_end_offset
+    )
+
+    baseline_region = trace[
+        baseline_start_in_trace:
+        baseline_end_in_trace
+    ]
+
+    baseline_voltage = np.mean(
+        baseline_region
+    )
+
+    corrected_trace = (
+        trace - baseline_voltage
+    )
+
+    pulse_traces.append(
+        corrected_trace
+    )
+
+        # ========================================================
+    # VOLTAGE TRANSIENT METRICS
+    # ========================================================
+
+    # Convert pulse duration to samples
+    pulse_duration_samples = int(
+        pulse_duration_ms / 1000 / dt
+    )
+
+    pulse_end_index_in_trace = (
+        pre_samples
+        + pulse_duration_samples
+    )
+
+    # Prevent exceeding the extracted trace
+    pulse_end_index_in_trace = min(
+        pulse_end_index_in_trace,
+        len(corrected_trace)
+    )
+
+    # --------------------------------------------------------
+    # REGION DURING THE ACTUAL CURRENT PULSE
+    # --------------------------------------------------------
+
+    pulse_region = corrected_trace[
+        pre_samples:
+        pulse_end_index_in_trace
+    ]
+
+    pulse_time_region = relative_time[
+        pre_samples:
+        pulse_end_index_in_trace
+    ]
+
+    # --------------------------------------------------------
+    # Vmax
+    #
+    # Largest absolute voltage excursion during the pulse.
+    # Keep both magnitude and signed voltage.
+    # --------------------------------------------------------
+
+    vmax_local_index = np.argmax(
+        np.abs(pulse_region)
+    )
+
+    vmax_signed = pulse_region[
+        vmax_local_index
+    ]
+
+    vmax_abs = abs(
+        vmax_signed
+    )
+
+    vmax_time_ms = (
+        pulse_time_region[
+            vmax_local_index
+        ]
+        * 1000
+    )
+
+    # --------------------------------------------------------
+    # COMPLIANCE MARGIN
+    # --------------------------------------------------------
+
+    compliance_margin_v = (
+        compliance_voltage_v
+        - vmax_abs
+    )
+
+    # --------------------------------------------------------
+    # Va
+    #
+    # Approximate immediate resistive/access voltage using
+    # a short averaging region immediately after onset.
+    # --------------------------------------------------------
+
+    va_start_index = np.argmin(
+        np.abs(
+            relative_time * 1000
+            - va_start_ms
+        )
+    )
+
+    va_end_index = np.argmin(
+        np.abs(
+            relative_time * 1000
+            - va_end_ms
+        )
+    )
+
+    if va_end_index <= va_start_index:
+        va_end_index = va_start_index + 1
+
+    va_region = corrected_trace[
+        va_start_index:
+        va_end_index
+    ]
+
+    va_signed = np.mean(
+        va_region
+    )
+
+    va_abs = abs(
+        va_signed
+    )
+
+    # --------------------------------------------------------
+    # VOLTAGE NEAR END OF CURRENT PULSE
+    # --------------------------------------------------------
+
+    end_average_samples = max(
+        1,
+        int(
+            end_pulse_average_ms
+            / 1000
+            / dt
+        )
+    )
+
+    end_average_start = max(
+        pre_samples,
+        pulse_end_index_in_trace
+        - end_average_samples
+    )
+
+    end_voltage_region = corrected_trace[
+        end_average_start:
+        pulse_end_index_in_trace
+    ]
+
+    v_end_signed = np.mean(
+        end_voltage_region
+    )
+
+    v_end_abs = abs(
+        v_end_signed
+    )
+
+    # --------------------------------------------------------
+    # DELTA Vpol
+    #
+    # Change in voltage after the initial Va jump.
+    #
+    # Signed value tells you direction.
+    # Magnitude is convenient for comparisons.
+    # --------------------------------------------------------
+
+    delta_vpol_signed = (
+        v_end_signed
+        - va_signed
+    )
+
+    delta_vpol_abs = abs(
+        delta_vpol_signed
+    )
+
+    # ========================================================
+    # OLD MIN/MAX METRICS
+    # ========================================================
+
+    minimum_voltage = np.min(
+        pulse_region
+    )
+
+    maximum_voltage = np.max(
+        pulse_region
+    )
+
+    min_index = np.argmin(
+        pulse_region
+    )
+
+    max_index = np.argmax(
+        pulse_region
+    )
+
+    min_time_ms = (
+        pulse_time_region[
+            min_index
+        ]
+        * 1000
+    )
+
+    max_time_ms = (
+        pulse_time_region[
+            max_index
+        ]
+        * 1000
+    )
+
+    # ========================================================
+    # VOLTAGE AT SPECIFIC TIMES
+    # ========================================================
+
+    def voltage_at_ms(target_ms):
+
+        index = np.argmin(
+            np.abs(
+                relative_time * 1000
+                - target_ms
+            )
+        )
+
+        return corrected_trace[index]
+
+    pulse_metrics.append({
+
+        "Pulse":
+            pulse_number,
+
+        "Pulse_Time_s":
+            time[pulse_index],
+
+        "Baseline_V":
+            baseline_voltage,
+
+        # ------------------------------------
+        # NEW IMPORTANT METRICS
+        # ------------------------------------
+
+        "Vmax_V":
+            vmax_abs,
+
+        "Vmax_Signed_V":
+            vmax_signed,
+
+        "Vmax_Time_ms":
+            vmax_time_ms,
+
+        "Compliance_Margin_V":
+            compliance_margin_v,
+
+        "Va_V":
+            va_abs,
+
+        "Va_Signed_V":
+            va_signed,
+
+        "V_End_V":
+            v_end_abs,
+
+        "V_End_Signed_V":
+            v_end_signed,
+
+        "Delta_Vpol_V":
+            delta_vpol_abs,
+
+        "Delta_Vpol_Signed_V":
+            delta_vpol_signed,
+
+        # ------------------------------------
+        # EXISTING METRICS
+        # ------------------------------------
+
+        "Minimum_V":
+            minimum_voltage,
+
+        "Minimum_Time_ms":
+            min_time_ms,
+
+        "Maximum_V":
+            maximum_voltage,
+
+        "Maximum_Time_ms":
+            max_time_ms,
+
+        "V_1ms":
+            voltage_at_ms(1),
+
+        "V_5ms":
+            voltage_at_ms(5),
+
+        "V_10ms":
+            voltage_at_ms(10),
+
+        "V_20ms":
+            voltage_at_ms(20),
+
+        "V_50ms":
+            voltage_at_ms(50),
+    })
+
+    # ========================================================
+    # VOLTAGE AT SPECIFIC TIMES
+    # ========================================================
+
+    def voltage_at_ms(target_ms):
+
+        index = np.argmin(
+            np.abs(
+                relative_time * 1000
+                - target_ms
+            )
+        )
+
+        return corrected_trace[index]
+
+    pulse_metrics.append({
+
+        "Pulse": pulse_number,
+
+        "Pulse_Time_s":
+            time[pulse_index],
+
+        "Baseline_V":
+            baseline_voltage,
+
+        "Minimum_V":
+            minimum_voltage,
+
+        "Minimum_Time_ms":
+            min_time_ms,
+
+        "Maximum_V":
+            maximum_voltage,
+
+        "Maximum_Time_ms":
+            max_time_ms,
+
+        "V_1ms":
+            voltage_at_ms(1),
+
+        "V_5ms":
+            voltage_at_ms(5),
+
+        "V_10ms":
+            voltage_at_ms(10),
+
+        "V_20ms":
+            voltage_at_ms(20),
+
+        "V_50ms":
+            voltage_at_ms(50),
+    })
+
+# ============================================================
+# CONVERT TO ARRAYS / DATAFRAMES
+# ============================================================
+
+pulse_traces = np.array(
+    pulse_traces
+)
+
+metrics_df = pd.DataFrame(
+    pulse_metrics
+)
+
+# ============================================================
+# AVERAGE TRANSIENT
+# ============================================================
+
+mean_trace = np.mean(
+    pulse_traces,
+    axis=0
+)
+
+median_trace = np.median(
+    pulse_traces, 
+    axis=0
+)
+
+std_trace = np.std(
+    pulse_traces,
+    axis=0,
+    ddof=1
+)
+
+output_folder = file_path.parent
+
+# ============================================================
+# RAW RECORDING
+# ============================================================
+
+plt.figure(
+    figsize=(12, 5)
+)
+
+plt.plot(
+    time,
+    voltage,
+    linewidth=0.8
+)
+
+for index in refined_pulse_indices:
+
+    plt.axvline(
+        time[index],
+        alpha=0.2
+    )
+
+plt.xlabel(
+    "Time (s)"
+)
+
+plt.ylabel(
+    "WE-CE Voltage (V)"
+)
+
+plt.title(
+    "Raw Recording with Refined Pulse Onsets"
+)
+
+plt.tight_layout()
+
+raw_plot_output = (
+    output_folder
+    / f"{file_path.stem}_raw_recording.jpg"
+)
+
+plt.savefig(
+    raw_plot_output,
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# INDIVIDUAL BASELINE-CORRECTED TRANSIENTS
+# ============================================================
+
+plt.figure(
+    figsize=(10, 6)
+)
+
+for trace in pulse_traces:
+
+    plt.plot(
+        relative_time * 1000,
+        trace,
+        alpha=0.25,
+        linewidth=0.8
+    )
+
+plt.axvline(
+    0,
+    linestyle="--"
+)
+
+plt.axhline(
+    0,
+    linestyle="--",
+    linewidth=0.8
+)
+
+plt.xlabel(
+    "Time Relative to Pulse Onset (ms)"
+)
+
+plt.ylabel(
+    "Baseline-Corrected WE-CE Voltage (V)"
+)
+
+plt.title(
+    "Individual Voltage Pulse Transients"
+)
+
+plt.tight_layout()
+
+individual_plot_output = (
+    output_folder
+    / f"{file_path.stem}_individual_transients.jpg"
+)
+
+plt.savefig(
+    individual_plot_output,
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+# ============================================================
+# ZOOMED INDIVIDUAL PULSE TRANSIENTS
+# ============================================================
+
+if save_zoomed_individual_pulses:
+
+    zoom_folder = (
+        output_folder
+        / f"{file_path.stem}_zoomed_pulses"
+    )
+
+    zoom_folder.mkdir(
+        exist_ok=True
+    )
+
+    zoom_start_ms = -zoom_pre_ms
+
+    zoom_end_ms = (
+        pulse_duration_ms
+        + zoom_post_ms
+    )
+
+    for pulse_number, trace in enumerate(
+        pulse_traces,
+        start=1
+    ):
+
+        plt.figure(
+            figsize=(10, 6)
+        )
+
+        plt.plot(
+            relative_time * 1000,
+            trace,
+            linewidth=1.5
+        )
+
+        # Pulse onset
+        plt.axvline(
+            0,
+            linestyle="--",
+            linewidth=1
+        )
+
+        # Pulse end
+        plt.axvline(
+            pulse_duration_ms,
+            linestyle="--",
+            linewidth=1
+        )
+
+        plt.axhline(
+            0,
+            linestyle="--",
+            linewidth=0.8
+        )
+
+        plt.xlim(
+            zoom_start_ms,
+            zoom_end_ms
+        )
+
+        plt.xlabel(
+            "Time Relative to Pulse Onset (ms)"
+        )
+
+        plt.ylabel(
+            "Baseline-Corrected WE-CE Voltage (V)"
+        )
+
+        plt.title(
+            f"Pulse {pulse_number} - Zoomed Voltage Transient"
+        )
+
+        plt.tight_layout()
+
+        zoom_output = (
+            zoom_folder
+            / f"{file_path.stem}_pulse_{pulse_number:02d}_zoom.jpg"
+        )
+
+        plt.savefig(
+            zoom_output,
+            dpi=300,
+            bbox_inches="tight"
+        )
+
+        plt.close()
+
+# ============================================================
+# MEAN TRANSIENT
+# ============================================================
+
+plt.figure(
+    figsize=(10, 6)
+)
+
+plt.plot(
+    relative_time * 1000,
+    mean_trace,
+    linewidth=2,
+    label="Mean"
+)
+
+plt.fill_between(
+    relative_time * 1000,
+    mean_trace - std_trace,
+    mean_trace + std_trace,
+    alpha=0.2,
+    label="±1 SD"
+)
+
+plt.axvline(
+    0,
+    linestyle="--"
+)
+
+plt.axhline(
+    0,
+    linestyle="--",
+    linewidth=0.8
+)
+
+plt.xlabel(
+    "Time Relative to Pulse Onset (ms)"
+)
+
+plt.ylabel(
+    "Baseline-Corrected WE-CE Voltage (V)"
+)
+
+plt.title(
+    "Average Voltage Pulse Transient"
+)
+
+plt.legend()
+
+plt.tight_layout()
+
+mean_plot_output = (
+    output_folder
+    / f"{file_path.stem}_average_transient.jpg"
+)
+
+plt.savefig(
+    mean_plot_output,
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+metrics_output = (
+    output_folder
+    / f"{file_path.stem}_pulse_metrics.csv"
+)
+
+metrics_df.to_csv(
+    metrics_output,
+    index=False
+)
+
+average_df = pd.DataFrame({
+
+    "Time_ms":
+        relative_time * 1000,
+
+    "Mean_V":
+        mean_trace,
+
+    "Median_V":
+        median_trace,
+
+    "SD_V":
+        std_trace
+})
+
+average_output = (
+    output_folder
+    / f"{file_path.stem}_average_transient.csv"
+)
+
+average_df.to_csv(
+    average_output,
+    index=False
+)
+
+print("\nSaved:")
+print(metrics_output)
+print(average_output)
+
+print("\nPulse Metrics:")
+print(metrics_df)

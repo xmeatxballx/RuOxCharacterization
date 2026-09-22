@@ -7,21 +7,21 @@ import matplotlib.pyplot as plt
 # USER SETTINGS
 # ============================================================
 
-file_path = Path(r"C:\Users\mtpv1\Downloads\PulseTransients_9_10_26\4_1_Al\4_1_Al_250.csv")
+file_path = Path(r"E:\PulseTransient_9_22_26\rcr023_Ch2.csv")
 
 # Approximate window around each pulse
-pre_pulse_ms = 20
-post_pulse_ms = 100
+pre_pulse_ms = 5
+post_pulse_ms = 20
 
 # Baseline window relative to approximate pulse location
-baseline_start_ms = -15
-baseline_end_ms = -2
+baseline_start_ms = -4
+baseline_end_ms = -0.5
 
 # Initial rough pulse detection
 rough_detection_threshold_v = 0.8
 
 # Minimum spacing between separate pulses
-minimum_pulse_spacing_ms = 100
+minimum_pulse_spacing_ms = 30
 
 # Refined onset detection
 onset_sigma_threshold = 6

@@ -1,0 +1,604 @@
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+sense_resistor_ohm = 99_200
+
+# Ch2 probe capacitance
+sense_probe_capacitance_f = 3.9e-12
+
+
+# ============================================================
+# EXPERIMENT SETTINGS
+# ============================================================
+
+# Point this directly to ONE experiment folder
+experiment_folder = Path(
+    r"E:\Variance Testing\MoreN"
+)
+
+# All measurements in this folder were taken at this frequency
+frequency_hz = 1000
+
+# Metadata
+wafer = "4"
+device = "1"
+material = "Al"
+size = "100"
+
+# Experiment label
+experiment_name = "Repeated_Same_Contact"
+
+# True for experiments 1 and 2
+# False for experiment 3 if you do not care about statistics
+calculate_statistics = True
+
+
+# ============================================================
+# OUTPUT FOLDER
+# ============================================================
+
+output_folder = experiment_folder
+
+output_folder.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# LOAD TEKTRONIX CSV
+# ============================================================
+
+def load_tektronix_csv(filename):
+
+    df = pd.read_csv(
+        filename,
+        header=None,
+        usecols=[3, 4],
+        names=["time_s", "voltage_v"]
+    )
+
+    df["time_s"] = pd.to_numeric(
+        df["time_s"],
+        errors="coerce"
+    )
+
+    df["voltage_v"] = pd.to_numeric(
+        df["voltage_v"],
+        errors="coerce"
+    )
+
+    df = df.dropna().reset_index(drop=True)
+
+    return df
+
+
+# ============================================================
+# SINE FIT
+# ============================================================
+
+def fit_sine(df, frequency_hz):
+
+    t = df["time_s"].to_numpy()
+    v = df["voltage_v"].to_numpy()
+
+    omega = 2 * np.pi * frequency_hz
+
+    X = np.column_stack([
+        np.sin(omega * t),
+        np.cos(omega * t),
+        np.ones_like(t)
+    ])
+
+    coefficients, _, _, _ = np.linalg.lstsq(
+        X,
+        v,
+        rcond=None
+    )
+
+    a, b, offset = coefficients
+
+    amplitude_peak = np.sqrt(
+        a**2 + b**2
+    )
+
+    amplitude_rms = (
+        amplitude_peak / np.sqrt(2)
+    )
+
+    phase_deg = np.degrees(
+        np.arctan2(b, a)
+    )
+
+    fitted_v = X @ coefficients
+
+    residual = (
+        v - fitted_v
+    )
+
+    residual_rms = np.sqrt(
+        np.mean(residual**2)
+    )
+
+    # Prevent divide-by-zero
+    if residual_rms > 0:
+
+        snr_linear = (
+            amplitude_rms
+            / residual_rms
+        )
+
+        snr_db = (
+            20
+            * np.log10(snr_linear)
+        )
+
+    else:
+
+        snr_db = np.inf
+
+    ss_res = np.sum(
+        residual**2
+    )
+
+    ss_tot = np.sum(
+        (v - np.mean(v))**2
+    )
+
+    if ss_tot > 0:
+
+        r_squared = (
+            1
+            - ss_res / ss_tot
+        )
+
+    else:
+
+        r_squared = np.nan
+
+    return {
+
+        "rms_v":
+            amplitude_rms,
+
+        "phase_deg":
+            phase_deg,
+
+        "offset_v":
+            offset,
+
+        "residual_rms_v":
+            residual_rms,
+
+        "snr_db":
+            snr_db,
+
+        "r_squared":
+            r_squared
+    }
+
+
+# ============================================================
+# ANALYZE ONE CH1 / CH2 PAIR
+# ============================================================
+
+def analyze_pair(
+    voltage_file,
+    sense_file,
+    frequency_hz,
+    sense_resistor_ohm,
+    sense_probe_capacitance_f
+):
+
+    voltage_df = load_tektronix_csv(
+        voltage_file
+    )
+
+    sense_df = load_tektronix_csv(
+        sense_file
+    )
+
+    voltage_fit = fit_sine(
+        voltage_df,
+        frequency_hz
+    )
+
+    sense_fit = fit_sine(
+        sense_df,
+        frequency_hz
+    )
+
+    # --------------------------------------------------------
+    # Convert fitted voltages to phasors
+    # --------------------------------------------------------
+
+    voltage_phasor = (
+        voltage_fit["rms_v"]
+        * np.exp(
+            1j
+            * np.radians(
+                voltage_fit["phase_deg"]
+            )
+        )
+    )
+
+    sense_phasor = (
+        sense_fit["rms_v"]
+        * np.exp(
+            1j
+            * np.radians(
+                sense_fit["phase_deg"]
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # Correct sense branch for probe capacitance
+    # --------------------------------------------------------
+
+    omega = (
+        2
+        * np.pi
+        * frequency_hz
+    )
+
+    sense_admittance = (
+        1 / sense_resistor_ohm
+        + 1j
+        * omega
+        * sense_probe_capacitance_f
+    )
+
+    current_phasor = (
+        sense_phasor
+        * sense_admittance
+    )
+
+    current_rms = abs(
+        current_phasor
+    )
+
+    # --------------------------------------------------------
+    # Cell voltage
+    # --------------------------------------------------------
+
+    cell_voltage_phasor = (
+        voltage_phasor
+        - sense_phasor
+    )
+
+    # --------------------------------------------------------
+    # Cell impedance
+    # --------------------------------------------------------
+
+    cell_impedance = (
+        cell_voltage_phasor
+        / current_phasor
+    )
+
+    impedance_ohm = abs(
+        cell_impedance
+    )
+
+    phase_deg = np.degrees(
+        np.angle(
+            cell_impedance
+        )
+    )
+
+    return {
+
+        "Applied_Vrms_mV":
+            voltage_fit["rms_v"] * 1000,
+
+        "Cell_Vrms_mV":
+            abs(cell_voltage_phasor) * 1000,
+
+        "Sense_Vrms_mV":
+            sense_fit["rms_v"] * 1000,
+
+        "Current_nA":
+            current_rms * 1e9,
+
+        "Impedance_Ohm":
+            impedance_ohm,
+
+        "Impedance_kOhm":
+            impedance_ohm / 1000,
+
+        "Phase_deg":
+            phase_deg,
+
+        "Sense_SNR_dB":
+            sense_fit["snr_db"],
+
+        "Sense_R2":
+            sense_fit["r_squared"],
+
+        "Sense_Residual_mV":
+            sense_fit["residual_rms_v"] * 1000
+    }
+
+
+# ============================================================
+# FIND AND ANALYZE ALL REPLICATES
+# ============================================================
+
+all_results = []
+
+voltage_files = sorted(
+    experiment_folder.glob("*_Ch1.csv")
+)
+
+print(
+    f"\nFound {len(voltage_files)} "
+    f"possible Ch1 files."
+)
+
+replicate_number = 0
+
+
+for voltage_file in voltage_files:
+
+    # --------------------------------------------------------
+    # Create corresponding Ch2 filename
+    #
+    # Anything like:
+    #
+    # measurement_1.csv
+    #
+    # becomes:
+    #
+    # measurement_2.csv
+    #
+    # --------------------------------------------------------
+
+    base_name = voltage_file.stem.replace(
+    "_Ch1",
+    ""
+    )
+
+    sense_file = (
+    experiment_folder
+    / f"{base_name}_Ch2.csv"
+    )
+
+    if not sense_file.exists():
+
+        print(
+            f"Missing Ch2 pair for: "
+            f"{voltage_file.name}"
+        )
+
+        continue
+
+    replicate_number += 1
+
+    print(
+        f"Analyzing replicate "
+        f"{replicate_number}: "
+        f"{base_name}"
+    )
+
+    result = analyze_pair(
+        voltage_file,
+        sense_file,
+        frequency_hz,
+        sense_resistor_ohm,
+        sense_probe_capacitance_f
+    )
+
+    # --------------------------------------------------------
+    # Add metadata
+    # --------------------------------------------------------
+
+    result["Replicate"] = (
+        replicate_number
+    )
+
+    result["Measurement_Name"] = (
+        base_name
+    )
+
+    result["Frequency_Hz"] = (
+        frequency_hz
+    )
+
+    result["Wafer"] = wafer
+
+    result["Device"] = device
+
+    result["Material"] = material
+
+    result["Size_um"] = size
+
+    result["Experiment"] = (
+        experiment_name
+    )
+
+    all_results.append(
+        result
+    )
+
+
+# ============================================================
+# CREATE RESULTS DATAFRAME
+# ============================================================
+
+results_df = pd.DataFrame(
+    all_results
+)
+
+
+if len(results_df) == 0:
+
+    print(
+        "\nNo valid EIS file pairs found."
+    )
+
+else:
+
+    # Put useful identifying columns first
+
+    column_order = [
+
+        "Experiment",
+        "Replicate",
+        "Measurement_Name",
+
+        "Wafer",
+        "Device",
+        "Material",
+        "Size_um",
+
+        "Frequency_Hz",
+
+        "Applied_Vrms_mV",
+        "Cell_Vrms_mV",
+        "Sense_Vrms_mV",
+
+        "Current_nA",
+
+        "Impedance_Ohm",
+        "Impedance_kOhm",
+
+        "Phase_deg",
+
+        "Sense_SNR_dB",
+        "Sense_R2",
+        "Sense_Residual_mV"
+    ]
+
+    results_df = results_df[
+        column_order
+    ]
+
+
+    # ========================================================
+    # SAVE INDIVIDUAL MEASUREMENTS
+    # ========================================================
+
+    results_output = (
+        output_folder
+        / f"{experiment_name}_individual_results.csv"
+    )
+
+    results_df.to_csv(
+        results_output,
+        index=False
+    )
+
+    print(
+        f"\nIndividual measurements saved to:\n"
+        f"{results_output}"
+    )
+
+
+    # ========================================================
+    # SUMMARY STATISTICS
+    # ========================================================
+
+    if calculate_statistics:
+
+        n = len(
+            results_df
+        )
+
+        mean_impedance_ohm = (
+            results_df[
+                "Impedance_Ohm"
+            ].mean()
+        )
+
+        std_impedance_ohm = (
+            results_df[
+                "Impedance_Ohm"
+            ].std(
+                ddof=1
+            )
+        )
+
+        mean_impedance_kohm = (
+            mean_impedance_ohm
+            / 1000
+        )
+
+        std_impedance_kohm = (
+            std_impedance_ohm
+            / 1000
+        )
+
+        summary_df = pd.DataFrame([{
+
+            "Experiment":
+                experiment_name,
+
+            "Wafer":
+                wafer,
+
+            "Device":
+                device,
+
+            "Material":
+                material,
+
+            "Size_um":
+                size,
+
+            "Frequency_Hz":
+                frequency_hz,
+
+            "N":
+                n,
+
+            "Mean_Impedance_Ohm":
+                mean_impedance_ohm,
+
+            "SD_Impedance_Ohm":
+                std_impedance_ohm,
+
+            "Mean_Impedance_kOhm":
+                mean_impedance_kohm,
+
+            "SD_Impedance_kOhm":
+                std_impedance_kohm
+        }])
+
+        summary_output = (
+            output_folder
+            / f"{experiment_name}_summary.csv"
+        )
+
+        summary_df.to_csv(
+            summary_output,
+            index=False
+        )
+
+        print(
+            f"\nSummary statistics saved to:\n"
+            f"{summary_output}"
+        )
+
+        print(
+            "\nImpedance summary:"
+        )
+
+        print(
+            f"N = {n}"
+        )
+
+        print(
+            f"Mean = "
+            f"{mean_impedance_kohm:.2f} kΩ"
+        )
+
+        print(
+            f"SD = "
+            f"{std_impedance_kohm:.2f} kΩ"
+        )
